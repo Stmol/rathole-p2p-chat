@@ -1,7 +1,7 @@
 //! Iroh-backed implementation of the transport-neutral delivery stream.
 //!
 //! This adapter deliberately exposes only the already-opened stream halves and
-//! their lifecycle operations. It does not own a [`PeerSession`], connection,
+//! their lifecycle operations. It does not own a [`PeerSession`](super::session::PeerSession), connection,
 //! delivery queue, or contact allowlist: those concerns belong to the session
 //! and delivery-policy layers, which also own deadlines and error mapping.
 
@@ -22,7 +22,7 @@ use super::delivery::DeliveryStream;
 /// The adapter intentionally contains no peer-session, connection, queue, or
 /// allowlist state. Its lifecycle is limited to one already-opened stream and
 /// therefore cannot make ownership or policy decisions for its caller.
-pub(super) struct IrohDeliveryStream {
+pub(crate) struct IrohDeliveryStream {
     /// Iroh send half used directly by framed delivery writes.
     send: SendStream,
     /// Iroh receive half used directly by framed delivery reads.
@@ -40,7 +40,7 @@ impl IrohDeliveryStream {
     ///
     /// The stream identifier is read exactly once from `send`; subsequent
     /// delivery stages use the stored numeric value without querying Iroh.
-    pub(super) fn new(send: SendStream, recv: RecvStream) -> Self {
+    pub(crate) fn new(send: SendStream, recv: RecvStream) -> Self {
         let stream_id = u64::from(send.id());
         Self {
             send,
