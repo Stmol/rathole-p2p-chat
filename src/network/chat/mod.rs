@@ -3,6 +3,8 @@
 #[allow(dead_code)]
 mod delivery;
 mod framing;
+#[allow(dead_code)]
+mod iroh_stream;
 mod path_diagnostics;
 mod session;
 mod transport;
