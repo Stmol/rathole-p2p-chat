@@ -1,3 +1,15 @@
+//! Per-peer session actor, connection ownership, and delivery orchestration.
+//!
+//! This module is the sole owner of the lifecycle for one authenticated Iroh
+//! peer: it serializes outgoing queue admission, selects and drains connections,
+//! coordinates exactly-once completion, and publishes existing connection and
+//! path diagnostics. Delivery framing, receipt validation, authorization order,
+//! and stream reset policy remain in [`super::delivery`]; Iroh stream finish and
+//! reset primitives remain in [`super::iroh_stream`]. All actor mutation occurs
+//! on its Tokio task. Spawned I/O tasks communicate results through
+//! [`SessionControl`], so a malformed stream cannot directly close a healthy
+//! connection or publish a spurious disconnected state.
+
 use std::{
     collections::VecDeque,
     sync::{
@@ -33,16 +45,38 @@ use crate::domain::{
 use crate::logging::{self, LogFields};
 use crate::protocol::{MessageId, WireEnvelope};
 
+/// An accepted outbound command and the bounds governing its eventual exchange.
+///
+/// The producer transfers ownership to [`PeerSession::try_enqueue`], then the
+/// session actor owns the command until it resolves `completion` once. `envelope`
+/// is the already-validated wire request, while `message_id` is retained for
+/// queue and diagnostic correlation. `deadline` is absolute and includes
+/// queueing; `cancellation` is shared with stream I/O to arbitrate races without
+/// extending delivery lifetime.
 #[derive(Clone)]
 pub(super) struct QueuedDelivery {
+    /// Validated text envelope consumed by the outbound delivery policy.
     pub(super) envelope: WireEnvelope,
+    /// Stable message identity used for completion matching and diagnostics.
     pub(super) message_id: MessageId,
+    /// One-shot receiver resolved by the actor with the terminal result.
     pub(super) completion: CompletionSlot,
+    /// Shared cancellation latch consulted by queue and stream stages.
     pub(super) cancellation: Arc<DeliveryCancellation>,
+    /// Absolute local-delivery bound, including queue wait and network I/O.
     pub(super) deadline: Instant,
+    /// Monotonic enqueue timestamp used only to report queue wait duration.
     pub(super) queued_at: Instant,
 }
 
+/// Handle for sending commands to one asynchronously running peer session.
+///
+/// Clones share a bounded outbound sender, actor control channel, queue counter,
+/// and external state watch receiver. The handle never owns an Iroh connection;
+/// `shutdown` transfers termination intent to the actor and waits for its task,
+/// which cancels active and queued completions. Calls are safe from concurrent
+/// Tokio tasks. Queue and shutdown errors are returned to callers rather than
+/// silently losing a command.
 #[derive(Clone)]
 pub(super) struct PeerSession {
     tx: mpsc::Sender<QueuedDelivery>,
@@ -135,6 +169,16 @@ enum SessionControl {
 }
 
 impl PeerSession {
+    /// Spawns the actor that owns a locally configured contact's peer lifecycle.
+    ///
+    /// `peer` is the authenticated endpoint identity, `inner` supplies shared
+    /// transport resources, and `session_permit` limits the lifetime of inbound
+    /// sessions. If `start_outbound` is true, the actor attempts one initial dial;
+    /// otherwise it waits for an inbound connection or an explicit request. The
+    /// returned handle is immediately usable and initially reports `Connecting`
+    /// or `NotConnected` consistently with that choice. Spawn failure is not
+    /// representable in Tokio's API; later network failures are surfaced through
+    /// delivery handles and connection diagnostics.
     pub(super) fn spawn(
         peer: EndpointId,
         inner: Arc<TransportInner>,
@@ -175,10 +219,23 @@ impl PeerSession {
         }
     }
 
+    /// Returns the latest externally visible state published by the actor.
+    ///
+    /// The value is a local watch snapshot, not remote presence or a guarantee
+    /// that a future stream will open. It is lock-free and may race with a later
+    /// actor transition, as expected for observational state.
     pub(super) fn connection_state(&self) -> ContactConnectionState {
         *self.state.borrow()
     }
 
+    /// Attempts to reserve and enqueue one outbound delivery without awaiting.
+    ///
+    /// Reservation updates the shared counter before sending so concurrent
+    /// callers cannot exceed the configured capacity. A full queue returns
+    /// [`DeliveryError::QueueFull`], and a stopped actor returns
+    /// [`DeliveryError::ShutDown`]; on either failure the reservation is released.
+    /// Successful commands become actor-owned and will receive exactly one
+    /// terminal completion.
     pub(super) fn try_enqueue(&self, delivery: QueuedDelivery) -> Result<(), DeliveryError> {
         let reserved = self
             .queued
@@ -202,6 +259,12 @@ impl PeerSession {
         }
     }
 
+    /// Transfers an authenticated inbound Iroh connection to the session actor.
+    ///
+    /// The actor applies deterministic primary/draining selection. If shutdown
+    /// has already begun, it closes the connection instead. This non-blocking
+    /// request intentionally has no caller-visible error because a closed actor
+    /// already represents a terminal session lifecycle.
     pub(super) fn attach_inbound(&self, connection: Connection) {
         let _ = self.control.send(SessionControl::Attach {
             connection,
@@ -209,10 +272,22 @@ impl PeerSession {
         });
     }
 
+    /// Requests the actor's one allowed outbound dial when it lacks a primary.
+    ///
+    /// The actor ignores duplicate, concurrent, shutdown, and previously attempted
+    /// requests, preserving the no-retry contract. The method is fire-and-forget;
+    /// dial outcomes appear through normal state diagnostics and delivery results.
     pub(super) fn request_outbound_dial(&self) {
         let _ = self.control.send(SessionControl::StartOutboundDial);
     }
 
+    /// Shuts down the actor and waits for all session-owned work to finish.
+    ///
+    /// `reason` is cloned into every active or queued delivery that must be
+    /// completed during termination. The first caller consumes and awaits the
+    /// join handle; concurrent or later callers only send the idempotent shutdown
+    /// control message. Connection closure and completion publication are actor
+    /// side effects, while this method itself reports no error.
     pub(super) async fn shutdown(&self, reason: DeliveryError) {
         let _ = self.control.send(SessionControl::Shutdown(reason));
         if let Some(join) = self.join.lock().await.take() {

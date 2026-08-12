@@ -2,6 +2,17 @@
 
 This module adapts the standalone Rathole wire protocol to authenticated Iroh connections. It owns peer sessions, connection lifecycle, stream framing, delivery admission, and runtime connection state. It does not own the CBOR schema; that contract is documented in [`src/protocol/README.md`](../../protocol/README.md).
 
+## Internal architecture
+
+`SessionActor` owns the lifecycle of each peer: queueing, delivery completion,
+connection selection, primary/draining transitions, path diagnostics, and
+shutdown. The delivery policy owns one complete message exchange, including
+framing, receipt validation, authorization ordering, deadlines, cancellation,
+and stream-reset decisions. The Iroh adapter owns only opened-stream primitives,
+including Iroh send completion and best-effort reset/stop operations. This
+separation keeps a failed or malformed stream local to that stream rather than
+turning it into a peer-session connection failure.
+
 ## Transport boundary
 
 - The chat endpoint uses the versioned ALPN `rathole/chat/1`.
