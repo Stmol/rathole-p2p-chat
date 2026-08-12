@@ -30,7 +30,14 @@ pub(super) enum DeliveryStage {
     /// The outbound text document was fully written to the send half.
     TextFrameWritten,
     /// The inbound text document was completely decoded and delimited.
-    TextFrameReceived,
+    ///
+    /// The decoded identifier lets the session retain message-scoped diagnostics
+    /// if a later authorization, publication, receipt-write, or finish operation
+    /// fails without producing an [`InboundOutcome`].
+    TextFrameReceived {
+        /// Identifier supplied by the decoded inbound text frame.
+        message_id: MessageId,
+    },
     /// A valid outbound receipt was decoded and matched to its message.
     ReceiptReceived,
     /// An inbound accepted or rejected receipt was fully written.
@@ -220,7 +227,7 @@ where
         stream.reset();
         return Err(DeliveryError::ProtocolViolation);
     };
-    observe(DeliveryStage::TextFrameReceived);
+    observe(DeliveryStage::TextFrameReceived { message_id });
 
     let authorised = match with_deadline(
         deadline,
@@ -796,5 +803,43 @@ mod tests {
             assert!(matches!(result, Ok(Err(DeliveryError::TimedOut))));
         }
         assert_eq!(reset_count.load(Ordering::Acquire), 1);
+    }
+
+    /// Decoding a text frame exposes its identifier before a later publication
+    /// failure, allowing the session adapter to retain message-scoped diagnostics.
+    #[tokio::test]
+    async fn inbound_exchange_observes_message_id_before_closed_publish_queue_failure() {
+        let message_id = MessageId::new([10; 16]);
+        let (mut stream, mut peer) = MemoryStream::pair(14);
+        let (incoming_tx, incoming_rx) = mpsc::channel(1);
+        drop(incoming_rx);
+        write_document(
+            &mut peer.sender,
+            &WireEnvelope::new(ChatFrame::text(message_id, 90, "unpublished").unwrap()),
+        )
+        .await
+        .unwrap();
+        peer.sender.shutdown().await.unwrap();
+        let cancellation = DeliveryCancellation::new();
+        let mut observed_message_id = None;
+
+        let result = inbound_exchange(
+            &mut stream,
+            PeerId::from_canonical("closed-queue-peer".to_owned()),
+            &incoming_tx,
+            Instant::now() + Duration::from_secs(1),
+            &cancellation,
+            || async { true },
+            |stage| {
+                if let DeliveryStage::TextFrameReceived { message_id } = stage {
+                    observed_message_id = Some(message_id);
+                }
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(DeliveryError::ShutDown)));
+        assert_eq!(observed_message_id, Some(message_id));
+        assert_eq!(stream.reset_count.load(Ordering::Acquire), 1);
     }
 }

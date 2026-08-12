@@ -1,9 +1,5 @@
-// The session adapter is introduced by the following delivery-exchange task.
-// Keep the policy seam lint-clean while it is intentionally not wired to Iroh.
-#[allow(dead_code)]
 mod delivery;
 mod framing;
-#[allow(dead_code)]
 mod iroh_stream;
 mod path_diagnostics;
 mod session;

@@ -28,8 +28,7 @@ use tokio::{
 };
 
 use super::delivery::{
-    DeliveryStage, DeliveryStream, InboundOutcome, inbound_exchange, outbound_exchange,
-    with_deadline,
+    DeliveryStage, DeliveryStream, inbound_exchange, outbound_exchange, with_deadline,
 };
 use super::iroh_stream::IrohDeliveryStream;
 use super::path_diagnostics::{path_event_details, selected_path_from_connection};
@@ -1168,7 +1167,7 @@ fn log_delivery_stage(
     let event = match stage {
         DeliveryStage::StreamOpened => "stream_opened",
         DeliveryStage::TextFrameWritten => "text_frame_written",
-        DeliveryStage::TextFrameReceived => "text_frame_received",
+        DeliveryStage::TextFrameReceived { .. } => "text_frame_received",
         DeliveryStage::ReceiptReceived => "receipt_received",
         DeliveryStage::ReceiptWritten => "receipt_write_finished",
     };
@@ -1196,7 +1195,7 @@ async fn handle_inbound_stream(
     let stream_id = stream.stream_id();
     let cancellation = DeliveryCancellation::new();
     let authorisation_inner = inner.clone();
-    let mut stages = Vec::with_capacity(2);
+    let mut message_id = None;
     let result = inbound_exchange(
         &mut stream,
         PeerId::from_canonical(peer.to_string()),
@@ -1204,24 +1203,24 @@ async fn handle_inbound_stream(
         Instant::now() + INBOUND_STREAM_TIMEOUT,
         &cancellation,
         move || async move { authorisation_inner.contacts.contains(&peer).await },
-        |stage| stages.push(stage),
+        |stage| {
+            if let DeliveryStage::TextFrameReceived {
+                message_id: decoded_message_id,
+            } = stage
+            {
+                message_id = Some(decoded_message_id);
+            }
+            log_delivery_stage(
+                &inner,
+                peer,
+                &connection,
+                message_id.as_ref(),
+                Some(stream_id),
+                stage,
+            );
+        },
     )
     .await;
-    let message_id = match result.as_ref() {
-        Ok(InboundOutcome::Accepted { message_id })
-        | Ok(InboundOutcome::Rejected { message_id, .. }) => Some(*message_id),
-        Err(_) => None,
-    };
-    for stage in stages {
-        log_delivery_stage(
-            &inner,
-            peer,
-            &connection,
-            message_id.as_ref(),
-            Some(stream_id),
-            stage,
-        );
-    }
     if let Err(error) = result {
         log_stream_reset(peer, connection_id, message_id.as_ref(), stream_id, error);
     }
