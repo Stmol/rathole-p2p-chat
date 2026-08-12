@@ -15,7 +15,9 @@ use tokio::{
     time::{self, Instant},
 };
 
-use super::framing::{FrameError, read_single_document, write_document};
+use super::delivery::{DeliveryStage, outbound_exchange, with_deadline};
+use super::framing::{read_single_document, write_document};
+use super::iroh_stream::IrohDeliveryStream;
 use super::path_diagnostics::{path_event_details, selected_path_from_connection};
 use super::transport::TransportInner;
 use super::{
@@ -977,6 +979,12 @@ fn spawn_connection_tasks(
     });
 }
 
+/// Spawns one outbound exchange while retaining completion ownership in `SessionActor`.
+///
+/// The task performs network I/O only; it forwards the result to the actor through
+/// [`SessionControl::OutboundFinished`] after resolving the command completion. This
+/// preserves the actor's ownership of queue capacity, active-delivery tracking, and
+/// connection lifecycle regardless of whether one stream succeeds or fails.
 fn spawn_outbound_stream(
     peer: EndpointId,
     inner: Arc<TransportInner>,
@@ -997,6 +1005,14 @@ fn spawn_outbound_stream(
     })
 }
 
+/// Opens and exchanges one outbound delivery stream on an actor-selected connection.
+///
+/// The caller has already reserved outbound capacity and selected `connection`.
+/// Opening the stream observes the queued command's absolute deadline and
+/// cancellation token. Once opened, the Iroh stream halves are adapted to the
+/// transport-neutral delivery policy, which owns framing, receipt validation, and
+/// best-effort reset on exchange errors. This function only returns that result: it
+/// never resolves a handle or changes session or connection ownership.
 async fn run_outbound_stream(
     peer: EndpointId,
     inner: Arc<TransportInner>,
@@ -1019,10 +1035,10 @@ async fn run_outbound_stream(
                     .to_string(),
             ),
     );
-    let (mut send, mut recv) = match run_stream_stage(
+    let (send, recv) = match with_deadline(
         command.deadline,
         connection.open_bi(),
-        &command.cancellation,
+        command.cancellation.as_ref(),
     )
     .await
     {
@@ -1031,105 +1047,55 @@ async fn run_outbound_stream(
         Err(error) => return Err(error),
     };
     let stream_id = u64::from(send.id());
-    inner.log_connection_snapshot(
-        "session",
-        "stream_opened",
-        peer,
-        Some(&command.message_id),
-        &connection,
-        Some(stream_id),
-    );
-    if let Err(error) = run_stream_stage(
-        command.deadline,
-        write_document(&mut send, &command.envelope),
-        &command.cancellation,
+    let message_id = command.message_id;
+    let deadline = command.deadline;
+    let cancellation = Arc::clone(&command.cancellation);
+    let envelope = command.envelope;
+    let mut stream = IrohDeliveryStream::new(send, recv);
+    let result = outbound_exchange(
+        &mut stream,
+        envelope,
+        deadline,
+        cancellation.as_ref(),
+        |stage| {
+            log_delivery_stage(
+                &inner,
+                peer,
+                &connection,
+                Some(&message_id),
+                Some(stream_id),
+                stage,
+            );
+        },
     )
-    .await
-    .and_then(|result| result.map_err(map_frame_error))
-    {
-        log_outbound_stream_reset(
-            peer,
-            connection_id,
-            &command.message_id,
-            stream_id,
-            &mut send,
-            &mut recv,
-            &error,
-        );
-        return Err(error);
+    .await;
+    if let Err(error) = &result {
+        log_outbound_stream_reset(peer, connection_id, &message_id, stream_id, error);
     }
-    inner.log_connection_snapshot(
-        "session",
-        "text_frame_written",
-        peer,
-        Some(&command.message_id),
-        &connection,
-        Some(stream_id),
-    );
-    if let Err(error) = send.finish() {
-        log_outbound_stream_reset(
-            peer,
-            connection_id,
-            &command.message_id,
-            stream_id,
-            &mut send,
-            &mut recv,
-            &error,
-        );
-        return Err(DeliveryError::Transport(error.to_string()));
-    }
-    let receipt = match run_stream_stage(
-        command.deadline,
-        read_single_document(&mut recv),
-        &command.cancellation,
-    )
-    .await
-    {
-        Ok(Ok(envelope)) => validate_receipt(command.message_id, envelope.frame),
-        Ok(Err(error)) => Err(map_frame_error(error)),
-        Err(error) => Err(error),
-    };
-    if receipt.is_err()
-        && let Err(error) = &receipt
-    {
-        log_outbound_stream_reset(
-            peer,
-            connection_id,
-            &command.message_id,
-            stream_id,
-            &mut send,
-            &mut recv,
-            error,
-        );
-    }
-    if let Ok(receipt) = receipt {
-        inner.log_connection_snapshot(
-            "session",
-            "receipt_received",
-            peer,
-            Some(&command.message_id),
-            &connection,
-            Some(stream_id),
-        );
-        Ok(receipt)
-    } else {
-        receipt
-    }
+    result
 }
 
-async fn run_stream_stage<T, E, F>(
-    deadline: Instant,
-    operation: F,
-    cancellation: &DeliveryCancellation,
-) -> Result<Result<T, E>, DeliveryError>
-where
-    F: std::future::Future<Output = Result<T, E>>,
-{
-    tokio::pin!(operation);
-    tokio::select! {
-        result = time::timeout_at(deadline, &mut operation) => result.map_err(|_| DeliveryError::TimedOut),
-        _ = cancellation.wait() => Err(DeliveryError::TimedOut),
-    }
+/// Emits outbound exchange diagnostics without transferring session ownership.
+///
+/// `stream_id` is captured before adapting the Iroh halves, so every emitted
+/// snapshot preserves the peer, message, connection, stream, and selected-path
+/// fields used by existing session observability. Inbound-only stages intentionally
+/// produce no outbound event; Task 4 will route them through inbound handling.
+fn log_delivery_stage(
+    inner: &TransportInner,
+    peer: EndpointId,
+    connection: &Connection,
+    message_id: Option<&MessageId>,
+    stream_id: Option<u64>,
+    stage: DeliveryStage,
+) {
+    let event = match stage {
+        DeliveryStage::StreamOpened => "stream_opened",
+        DeliveryStage::TextFrameWritten => "text_frame_written",
+        DeliveryStage::ReceiptReceived => "receipt_received",
+        DeliveryStage::TextFrameReceived | DeliveryStage::ReceiptWritten => return,
+    };
+    inner.log_connection_snapshot("session", event, peer, message_id, connection, stream_id);
 }
 
 async fn handle_inbound_stream(
@@ -1230,35 +1196,6 @@ async fn handle_inbound_stream(
     );
 }
 
-fn validate_receipt(
-    expected: MessageId,
-    frame: ChatFrame,
-) -> Result<DeliveryReceipt, DeliveryError> {
-    match frame {
-        ChatFrame::Accepted {
-            message_id,
-            received_at_unix_ms,
-        } if message_id == expected => Ok(DeliveryReceipt {
-            message_id,
-            received_at_unix_ms,
-        }),
-        ChatFrame::Rejected { message_id, code } if message_id == expected => {
-            Err(DeliveryError::Rejected(code))
-        }
-        _ => Err(DeliveryError::ProtocolViolation),
-    }
-}
-
-fn map_frame_error(error: FrameError) -> DeliveryError {
-    match error {
-        FrameError::Io(error) => DeliveryError::Transport(error.to_string()),
-        FrameError::DeclaredFrameTooLarge { declared } => {
-            DeliveryError::Transport(format!("declared frame too large: {declared}"))
-        }
-        FrameError::TrailingData | FrameError::Protocol(_) => DeliveryError::ProtocolViolation,
-    }
-}
-
 async fn finish_command(command: &QueuedDelivery, result: Result<DeliveryReceipt, DeliveryError>) {
     if command.cancellation.cancel() {
         resolve_once(&command.completion, result).await;
@@ -1298,16 +1235,19 @@ fn reset_stream_with_log(
     );
 }
 
+/// Records a failed outbound exchange after delivery policy reset its stream.
+///
+/// The delivery layer has already issued its idempotent reset before returning the
+/// error. This helper deliberately performs no Iroh operation: it preserves the
+/// existing warning event and stable peer, connection, message, and stream fields
+/// without risking a second reset or changing the connection's session ownership.
 fn log_outbound_stream_reset(
     peer: EndpointId,
     connection_id: usize,
     message_id: &MessageId,
     stream_id: u64,
-    send: &mut iroh::endpoint::SendStream,
-    recv: &mut iroh::endpoint::RecvStream,
     reason: impl std::fmt::Display,
 ) {
-    reset_stream(send, recv);
     logging::log_warn(
         "session",
         "stream_reset",
@@ -1340,23 +1280,6 @@ mod tests {
         assert!(is_preferred(higher, lower, ConnectionOrigin::Inbound));
         assert!(!is_preferred(higher, lower, ConnectionOrigin::Outbound));
         assert!(!is_preferred(lower, higher, ConnectionOrigin::Inbound));
-    }
-
-    #[test]
-    fn receipt_validation_rejects_wrong_message_and_frame() {
-        let expected = MessageId::new([1; 16]);
-        let wrong = MessageId::new([2; 16]);
-        assert!(matches!(
-            validate_receipt(expected, ChatFrame::accepted(wrong, 0)),
-            Err(DeliveryError::ProtocolViolation)
-        ));
-        assert!(matches!(
-            validate_receipt(
-                expected,
-                ChatFrame::text(wrong, 0, "not a receipt").unwrap()
-            ),
-            Err(DeliveryError::ProtocolViolation)
-        ));
     }
 
     #[test]

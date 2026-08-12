@@ -347,8 +347,15 @@ async fn subsequent_delivery_after_idle_keeps_the_connection_alive() {
         .send_text(bob.peer_id.clone(), "before idle")
         .await
         .unwrap();
+    let first_message_id = first.message_id;
     assert_eq!(bob.incoming.recv().await.unwrap().body, "before idle");
-    first.wait().await.unwrap();
+    let first_receipt = first.wait().await.unwrap();
+    assert_eq!(first_receipt.message_id, first_message_id);
+    assert_eq!(
+        alice.client.connection_state(&bob.peer_id).await,
+        Some(ContactConnectionState::Connected),
+        "a matching Accepted receipt must leave the primary connection reusable"
+    );
 
     tokio::time::sleep(INBOUND_STREAM_TIMEOUT + Duration::from_millis(250)).await;
 
@@ -357,8 +364,9 @@ async fn subsequent_delivery_after_idle_keeps_the_connection_alive() {
         .send_text(bob.peer_id.clone(), "after idle")
         .await
         .unwrap();
+    let second_message_id = second.message_id;
     assert_eq!(bob.incoming.recv().await.unwrap().body, "after idle");
-    second.wait().await.unwrap();
+    assert_eq!(second.wait().await.unwrap().message_id, second_message_id);
 
     alice.transport.shutdown().await.unwrap();
     bob.transport.shutdown().await.unwrap();
@@ -713,9 +721,9 @@ async fn wrong_receipt_frame_resets_only_the_stream_and_keeps_the_session() {
             let (mut send, mut recv) = connection.accept_bi().await.unwrap();
             let envelope = read_document(&mut recv).await.unwrap();
             assert!(matches!(envelope.frame, ChatFrame::Text { .. }));
-            let bogus = WireEnvelope::new(
-                ChatFrame::text(MessageId::new([9; 16]), 0, "not a receipt").unwrap(),
-            );
+            // An Accepted receipt for another delivery violates the exchange
+            // correlation contract and must reset only this bidi stream.
+            let bogus = WireEnvelope::new(ChatFrame::accepted(MessageId::new([9; 16]), 0));
             write_document(&mut send, &bogus).await.unwrap();
             send.finish().unwrap();
             // Keep the connection alive until the peer has read the reply.
