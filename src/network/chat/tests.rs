@@ -136,6 +136,19 @@ async fn direct_loopback_endpoint_addr(endpoint: &Endpoint) -> EndpointAddr {
     }
 }
 
+/// Verifies an invalid inbound stream receives no application receipt.
+///
+/// Delivery policy resets protocol failures, so Iroh may report either a reset
+/// transport error or an early end of stream. Both are failures to receive an
+/// `Accepted` or `Rejected` document and are therefore the required outcome.
+async fn assert_invalid_stream_has_no_receipt(recv: &mut iroh::endpoint::RecvStream) {
+    let result = tokio::time::timeout(Duration::from_secs(2), read_document(recv)).await;
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "invalid inbound stream unexpectedly received a receipt: {result:?}"
+    );
+}
+
 async fn connect_test_routes(alice: &TestPeer, bob: &TestPeer) {
     let alice_addr = direct_loopback_addr(&alice.transport).await;
     let bob_addr = direct_loopback_addr(&bob.transport).await;
@@ -334,6 +347,12 @@ async fn authorised_contacts_exchange_unicode_text_and_an_ack() {
     assert_eq!(incoming.body, "Привет, 👋\nRathole");
     assert_eq!(incoming.message_id, handle.message_id);
     assert_eq!(handle.wait().await.unwrap().message_id, incoming.message_id);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), bob.incoming.recv())
+            .await
+            .is_err(),
+        "one inbound Text must publish exactly one IncomingText"
+    );
 
     alice.transport.shutdown().await.unwrap();
     bob.transport.shutdown().await.unwrap();
@@ -445,14 +464,17 @@ async fn one_peer_session_preserves_queue_order_across_two_message_streams() {
 
 #[tokio::test]
 async fn unauthorised_sender_gets_unknown_contact_without_delivery() {
-    let mut alice = local_peer(SecretKey::from_bytes(&[61; 32]), []).await;
-    let bob = local_peer(SecretKey::from_bytes(&[62; 32]), []).await;
-    connect_test_routes(&alice, &bob).await;
-    bob.transport
-        .replace_contacts([alice.peer_id.clone()])
+    let (mut alice, bob) = local_pair().await;
+    // Update only the live allowlist: `replace_contacts` intentionally tears
+    // down removed sessions, while this test must exercise the exchange-time
+    // authorisation callback on an otherwise healthy accepted connection.
+    alice
+        .transport
+        .inner()
+        .contacts
+        .replace_peer_ids([])
         .await
         .unwrap();
-    wait_for_peer_state(&bob, &alice.peer_id, ContactConnectionState::Connected).await;
 
     let result = bob
         .client
@@ -469,6 +491,33 @@ async fn unauthorised_sender_gets_unknown_contact_without_delivery() {
         tokio::time::timeout(Duration::from_millis(50), alice.incoming.recv())
             .await
             .is_err()
+    );
+    assert_eq!(
+        bob.client.connection_state(&alice.peer_id).await,
+        Some(ContactConnectionState::Connected),
+        "a rejected stream must not close its healthy peer connection"
+    );
+
+    alice
+        .transport
+        .inner()
+        .contacts
+        .replace_peer_ids([bob.peer_id.clone()])
+        .await
+        .unwrap();
+    let accepted = bob
+        .client
+        .send_text(alice.peer_id.clone(), "connection remains usable")
+        .await
+        .unwrap();
+    let incoming = tokio::time::timeout(Duration::from_secs(2), alice.incoming.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(incoming.message_id, accepted.message_id);
+    assert_eq!(
+        accepted.wait().await.unwrap().message_id,
+        incoming.message_id
     );
 
     alice.transport.shutdown().await.unwrap();
@@ -678,18 +727,95 @@ async fn oversized_declared_length_produces_no_incoming_message() {
 
     let bob_addr = direct_loopback_addr(&bob.transport).await;
     let connection = alice.connect(bob_addr, CHAT_ALPN).await.unwrap();
-    let (mut send, _recv) = connection.open_bi().await.unwrap();
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
     let oversized = ((MAX_FRAME_BYTES as u32) + 1).to_be_bytes();
     tokio::io::AsyncWriteExt::write_all(&mut send, &oversized)
         .await
         .unwrap();
     let _ = send.finish();
+    assert_invalid_stream_has_no_receipt(&mut recv).await;
 
     assert!(
         tokio::time::timeout(Duration::from_millis(200), bob.incoming.recv())
             .await
             .is_err()
     );
+
+    alice.close().await;
+    bob.transport.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_and_trailing_inbound_streams_reset_without_receipts() {
+    let alice_secret = SecretKey::from_bytes(&[73; 32]);
+    let bob_secret = SecretKey::from_bytes(&[74; 32]);
+    let alice_id = peer_id_from_secret(&alice_secret);
+    let mut bob = local_peer(bob_secret, [alice_id]).await;
+    let alice = Endpoint::builder(presets::N0)
+        .secret_key(alice_secret)
+        .alpns(vec![CHAT_ALPN.to_vec()])
+        .relay_mode(iroh::RelayMode::Disabled)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let connection = alice
+        .connect(direct_loopback_addr(&bob.transport).await, CHAT_ALPN)
+        .await
+        .unwrap();
+
+    let (mut malformed_send, mut malformed_recv) = connection.open_bi().await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut malformed_send, &[0, 0, 0, 1, 0xff])
+        .await
+        .unwrap();
+    malformed_send.finish().unwrap();
+    assert_invalid_stream_has_no_receipt(&mut malformed_recv).await;
+
+    let (mut trailing_send, mut trailing_recv) = connection.open_bi().await.unwrap();
+    write_document(
+        &mut trailing_send,
+        &WireEnvelope::new(ChatFrame::text(MessageId::new([75; 16]), 1, "first").unwrap()),
+    )
+    .await
+    .unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut trailing_send, b"trailing")
+        .await
+        .unwrap();
+    trailing_send.finish().unwrap();
+    assert_invalid_stream_has_no_receipt(&mut trailing_recv).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), bob.incoming.recv())
+            .await
+            .is_err(),
+        "invalid streams must not publish IncomingText"
+    );
+
+    // A valid stream following both resets demonstrates that only each stream,
+    // rather than the accepted connection, was terminated.
+    let message_id = MessageId::new([76; 16]);
+    let (mut valid_send, mut valid_recv) = connection.open_bi().await.unwrap();
+    write_document(
+        &mut valid_send,
+        &WireEnvelope::new(ChatFrame::text(message_id, 2, "after reset").unwrap()),
+    )
+    .await
+    .unwrap();
+    valid_send.finish().unwrap();
+    let incoming = tokio::time::timeout(Duration::from_secs(2), bob.incoming.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(incoming.message_id, message_id);
+    let receipt = read_document(&mut valid_recv).await.unwrap();
+    assert!(matches!(
+        receipt.frame,
+        ChatFrame::Accepted {
+            message_id: received_id,
+            ..
+        } if received_id == message_id
+    ));
 
     alice.close().await;
     bob.transport.shutdown().await.unwrap();

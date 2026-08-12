@@ -12,24 +12,26 @@ use n0_future::StreamExt;
 use tokio::{
     sync::{Mutex, OwnedSemaphorePermit, mpsc, watch},
     task::JoinHandle,
-    time::{self, Instant},
+    time::Instant,
 };
 
-use super::delivery::{DeliveryStage, outbound_exchange, with_deadline};
-use super::framing::{read_single_document, write_document};
+use super::delivery::{
+    DeliveryStage, DeliveryStream, InboundOutcome, inbound_exchange, outbound_exchange,
+    with_deadline,
+};
 use super::iroh_stream::IrohDeliveryStream;
 use super::path_diagnostics::{path_event_details, selected_path_from_connection};
 use super::transport::TransportInner;
 use super::{
     CompletionSlot, DeliveryCancellation, DeliveryError, DeliveryReceipt, INBOUND_STREAM_TIMEOUT,
-    IncomingText, OUTGOING_QUEUE_CAPACITY, PeerConnectionEvent, resolve_once, unix_ms_now,
+    OUTGOING_QUEUE_CAPACITY, PeerConnectionEvent, resolve_once,
 };
 use crate::domain::{
     connection::{ContactConnectionState, SelectedPath},
     identity::PeerId,
 };
 use crate::logging::{self, LogFields};
-use crate::protocol::{ChatFrame, MessageId, RejectionCode, WireEnvelope};
+use crate::protocol::{MessageId, WireEnvelope};
 
 #[derive(Clone)]
 pub(super) struct QueuedDelivery {
@@ -389,17 +391,15 @@ impl SessionActor {
                             )
                             .await;
                         } else {
-                            let mut send = send;
-                            let mut recv = recv;
-                            reset_stream(&mut send, &mut recv);
+                            let mut stream = IrohDeliveryStream::new(send, recv);
+                            stream.reset();
                         }
                         drop(permit);
                         let _ = control.send(SessionControl::InboundFinished { connection_id });
                     });
                 } else {
-                    let mut send = send;
-                    let mut recv = recv;
-                    reset_stream(&mut send, &mut recv);
+                    let mut stream = IrohDeliveryStream::new(send, recv);
+                    stream.reset();
                     drop(permit);
                 }
             }
@@ -886,16 +886,16 @@ fn spawn_connection_tasks(
                                         .connection(connection_id)
                                         .reason("stream_handler_budget"),
                                 );
-                                let mut send = send;
-                                let mut recv = recv;
-                                reset_stream(&mut send, &mut recv);
+                                let stream_id = u64::from(send.id());
+                                let mut stream = IrohDeliveryStream::new(send, recv);
+                                stream.reset();
                                 logging::log_warn(
                                     "session",
                                     "stream_reset",
                                     LogFields::default()
                                         .peer_str(peer.to_string())
                                         .connection(connection_id)
-                                        .stream(u64::from(send.id()))
+                                        .stream(stream_id)
                                         .reason("stream_handler_budget"),
                                 );
                                 continue;
@@ -1070,17 +1070,18 @@ async fn run_outbound_stream(
     )
     .await;
     if let Err(error) = &result {
-        log_outbound_stream_reset(peer, connection_id, &message_id, stream_id, error);
+        log_stream_reset(peer, connection_id, Some(&message_id), stream_id, error);
     }
     result
 }
 
-/// Emits outbound exchange diagnostics without transferring session ownership.
+/// Emits delivery-exchange diagnostics without transferring session ownership.
 ///
 /// `stream_id` is captured before adapting the Iroh halves, so every emitted
 /// snapshot preserves the peer, message, connection, stream, and selected-path
-/// fields used by existing session observability. Inbound-only stages intentionally
-/// produce no outbound event; Task 4 will route them through inbound handling.
+/// fields used by existing session observability. `message_id` remains optional
+/// because malformed inbound bytes never yield a validated identifier and must not
+/// be represented by a fabricated value.
 fn log_delivery_stage(
     inner: &TransportInner,
     peer: EndpointId,
@@ -1092,108 +1093,63 @@ fn log_delivery_stage(
     let event = match stage {
         DeliveryStage::StreamOpened => "stream_opened",
         DeliveryStage::TextFrameWritten => "text_frame_written",
+        DeliveryStage::TextFrameReceived => "text_frame_received",
         DeliveryStage::ReceiptReceived => "receipt_received",
-        DeliveryStage::TextFrameReceived | DeliveryStage::ReceiptWritten => return,
+        DeliveryStage::ReceiptWritten => "receipt_write_finished",
     };
     inner.log_connection_snapshot("session", event, peer, message_id, connection, stream_id);
 }
 
+/// Runs one inbound delivery exchange on an already-accepted Iroh stream.
+///
+/// The connection task has called `accept_bi` exactly once before transferring
+/// ownership of its halves here. This function adapts those halves for
+/// [`inbound_exchange`], supplies the current allowlist callback immediately
+/// before publication, and records exchange-level diagnostics. Delivery policy
+/// resets failures itself, so this function only logs its error and never resets
+/// the Iroh stream a second time. A successful rejection is normal completion and
+/// leaves the connection available for future streams.
 async fn handle_inbound_stream(
     peer: EndpointId,
     inner: Arc<TransportInner>,
     connection: Connection,
     connection_id: usize,
-    mut send: iroh::endpoint::SendStream,
-    mut recv: iroh::endpoint::RecvStream,
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
 ) {
-    let stream_id = u64::from(send.id());
-    let envelope =
-        match time::timeout(INBOUND_STREAM_TIMEOUT, read_single_document(&mut recv)).await {
-            Ok(Ok(envelope)) => envelope,
-            Ok(Err(error)) => {
-                reset_stream_with_log(peer, connection_id, stream_id, &mut send, &mut recv, &error);
-                return;
-            }
-            Err(_) => {
-                reset_stream_with_log(
-                    peer,
-                    connection_id,
-                    stream_id,
-                    &mut send,
-                    &mut recv,
-                    "read timeout",
-                );
-                return;
-            }
-        };
-    let ChatFrame::Text {
-        message_id,
-        sent_at_unix_ms,
-        body,
-    } = envelope.frame
-    else {
-        reset_stream_with_log(
-            peer,
-            connection_id,
-            stream_id,
-            &mut send,
-            &mut recv,
-            "expected text frame",
-        );
-        return;
+    let mut stream = IrohDeliveryStream::new(send, recv);
+    let stream_id = stream.stream_id();
+    let cancellation = DeliveryCancellation::new();
+    let authorisation_inner = inner.clone();
+    let mut stages = Vec::with_capacity(2);
+    let result = inbound_exchange(
+        &mut stream,
+        PeerId::from_canonical(peer.to_string()),
+        &inner.incoming_tx,
+        Instant::now() + INBOUND_STREAM_TIMEOUT,
+        &cancellation,
+        move || async move { authorisation_inner.contacts.contains(&peer).await },
+        |stage| stages.push(stage),
+    )
+    .await;
+    let message_id = match result.as_ref() {
+        Ok(InboundOutcome::Accepted { message_id })
+        | Ok(InboundOutcome::Rejected { message_id, .. }) => Some(*message_id),
+        Err(_) => None,
     };
-    inner.log_connection_snapshot(
-        "session",
-        "text_frame_received",
-        peer,
-        Some(&message_id),
-        &connection,
-        Some(stream_id),
-    );
-    if !inner.contacts.contains(&peer).await {
-        let rejected = WireEnvelope::new(ChatFrame::rejected(
-            message_id,
-            RejectionCode::UnknownContact,
-        ));
-        if write_document(&mut send, &rejected).await.is_ok() {
-            let _ = send.finish();
-        }
-        return;
-    }
-    let incoming = IncomingText {
-        peer_id: crate::domain::identity::PeerId::from_canonical(peer.to_string()),
-        message_id,
-        sent_at_unix_ms,
-        body,
-    };
-    if inner.incoming_tx.send(incoming).await.is_err() {
-        reset_stream_with_log(
+    for stage in stages {
+        log_delivery_stage(
+            &inner,
             peer,
-            connection_id,
-            stream_id,
-            &mut send,
-            &mut recv,
-            "incoming queue closed",
+            &connection,
+            message_id.as_ref(),
+            Some(stream_id),
+            stage,
         );
-        return;
     }
-    let accepted = WireEnvelope::new(ChatFrame::accepted(message_id, unix_ms_now()));
-    if let Err(error) = write_document(&mut send, &accepted).await {
-        reset_stream_with_log(peer, connection_id, stream_id, &mut send, &mut recv, &error);
-        return;
+    if let Err(error) = result {
+        log_stream_reset(peer, connection_id, message_id.as_ref(), stream_id, error);
     }
-    if let Err(error) = send.finish() {
-        reset_stream_with_log(peer, connection_id, stream_id, &mut send, &mut recv, &error);
-        return;
-    }
-    inner.log_connection_snapshot(
-        "session",
-        "receipt_write_finished",
-        peer,
-        Some(&message_id),
-        &connection,
-        Some(stream_id),
-    );
 }
 
 async fn finish_command(command: &QueuedDelivery, result: Result<DeliveryReceipt, DeliveryError>) {
@@ -1210,54 +1166,29 @@ async fn force_finish_command(
     resolve_once(&command.completion, result).await;
 }
 
-fn reset_stream(send: &mut iroh::endpoint::SendStream, recv: &mut iroh::endpoint::RecvStream) {
-    let _ = send.reset(0u32.into());
-    let _ = recv.stop(0u32.into());
-}
-
-fn reset_stream_with_log(
-    peer: EndpointId,
-    connection_id: usize,
-    stream_id: u64,
-    send: &mut iroh::endpoint::SendStream,
-    recv: &mut iroh::endpoint::RecvStream,
-    reason: impl std::fmt::Display,
-) {
-    reset_stream(send, recv);
-    logging::log_warn(
-        "session",
-        "stream_reset",
-        LogFields::default()
-            .peer_str(peer.to_string())
-            .connection(connection_id)
-            .stream(stream_id)
-            .reason(reason.to_string()),
-    );
-}
-
-/// Records a failed outbound exchange after delivery policy reset its stream.
+/// Records a failed delivery exchange after delivery policy reset its stream.
 ///
 /// The delivery layer has already issued its idempotent reset before returning the
-/// error. This helper deliberately performs no Iroh operation: it preserves the
-/// existing warning event and stable peer, connection, message, and stream fields
-/// without risking a second reset or changing the connection's session ownership.
-fn log_outbound_stream_reset(
+/// error. This helper deliberately performs no Iroh operation, preserving the
+/// warning event without risking a second reset or changing connection ownership.
+/// `message_id` is absent when the failing inbound bytes could not be decoded into
+/// a valid text frame.
+fn log_stream_reset(
     peer: EndpointId,
     connection_id: usize,
-    message_id: &MessageId,
+    message_id: Option<&MessageId>,
     stream_id: u64,
     reason: impl std::fmt::Display,
 ) {
-    logging::log_warn(
-        "session",
-        "stream_reset",
-        LogFields::default()
-            .peer_str(peer.to_string())
-            .connection(connection_id)
-            .message(message_id)
-            .stream(stream_id)
-            .reason(reason.to_string()),
-    );
+    let mut fields = LogFields::default()
+        .peer_str(peer.to_string())
+        .connection(connection_id)
+        .stream(stream_id)
+        .reason(reason.to_string());
+    if let Some(message_id) = message_id {
+        fields = fields.message(message_id);
+    }
+    logging::log_warn("session", "stream_reset", fields);
 }
 
 #[cfg(test)]
