@@ -110,9 +110,10 @@ where
 /// Exchanges one outbound `Text` document for an authenticated peer receipt.
 ///
 /// The caller owns `stream` for its full lifetime and supplies the common delivery
-/// deadline and cancellation token. Any framing, timeout, cancellation, EOF, finish,
-/// or receipt-validation error resets exactly this stream once and returns a mapped
-/// [`DeliveryError`]; success never resets the stream.
+/// deadline and cancellation token. Every potentially blocking stage (write, finish,
+/// and receipt read) shares those bounds. Any framing, timeout, cancellation, EOF,
+/// finish, or receipt-validation error resets exactly this stream once and returns a
+/// mapped [`DeliveryError`]; success never resets the stream.
 pub(super) async fn outbound_exchange<S, Observe>(
     stream: &mut S,
     envelope: WireEnvelope,
@@ -142,9 +143,9 @@ where
         return Err(error);
     }
     observe(DeliveryStage::TextFrameWritten);
-    if let Err(error) = stream.finish().await {
+    if let Err(error) = finish_with_deadline(stream, deadline, cancellation).await {
         stream.reset();
-        return Err(DeliveryError::Transport(error.to_string()));
+        return Err(error);
     }
     let receipt = match with_deadline(
         deadline,
@@ -172,10 +173,12 @@ where
 /// Receives, authorises, publishes, and acknowledges one inbound `Text` document.
 ///
 /// `authorise` runs only after a complete text frame is decoded, and before any
-/// [`IncomingText`] publication. A false result writes `UnknownContact` and returns
-/// [`InboundOutcome::Rejected`] without resetting. Every malformed, timed-out,
-/// cancelled, EOF, publication, or stream-write failure resets this stream once;
-/// the surrounding connection remains owned by the caller.
+/// [`IncomingText`] publication. The read, authorisation, publication, receipt
+/// write, and finish stages all share the supplied deadline and cancellation token.
+/// A false result writes `UnknownContact` and returns [`InboundOutcome::Rejected`]
+/// without resetting. Every malformed, timed-out, cancelled, EOF, publication, or
+/// stream-write failure resets this stream once; the surrounding connection remains
+/// owned by the caller.
 pub(super) async fn inbound_exchange<S, Authorise, Authorisation, Observe>(
     stream: &mut S,
     peer_id: PeerId,
@@ -219,7 +222,21 @@ where
     };
     observe(DeliveryStage::TextFrameReceived);
 
-    if !authorise().await {
+    let authorised = match with_deadline(
+        deadline,
+        async { Ok::<bool, std::convert::Infallible>(authorise().await) },
+        cancellation,
+    )
+    .await
+    {
+        Ok(Ok(authorised)) => authorised,
+        Ok(Err(never)) => match never {},
+        Err(error) => {
+            stream.reset();
+            return Err(error);
+        }
+    };
+    if !authorised {
         let outcome = InboundOutcome::Rejected {
             message_id,
             code: RejectionCode::UnknownContact,
@@ -239,9 +256,9 @@ where
             stream.reset();
             return Err(error);
         }
-        if let Err(error) = stream.finish().await {
+        if let Err(error) = finish_with_deadline(stream, deadline, cancellation).await {
             stream.reset();
-            return Err(DeliveryError::Transport(error.to_string()));
+            return Err(error);
         }
         observe(DeliveryStage::ReceiptWritten);
         return Ok(outcome);
@@ -253,9 +270,12 @@ where
         sent_at_unix_ms,
         body,
     };
-    if incoming_tx.send(incoming).await.is_err() {
+    if let Err(error) = with_deadline(deadline, incoming_tx.send(incoming), cancellation)
+        .await
+        .and_then(|result| result.map_err(|_| DeliveryError::ShutDown))
+    {
         stream.reset();
-        return Err(DeliveryError::ShutDown);
+        return Err(error);
     }
     let accepted = WireEnvelope::new(ChatFrame::accepted(message_id, unix_ms_now()));
     if let Err(error) = with_deadline(
@@ -269,12 +289,30 @@ where
         stream.reset();
         return Err(error);
     }
-    if let Err(error) = stream.finish().await {
+    if let Err(error) = finish_with_deadline(stream, deadline, cancellation).await {
         stream.reset();
-        return Err(DeliveryError::Transport(error.to_string()));
+        return Err(error);
     }
     observe(DeliveryStage::ReceiptWritten);
     Ok(InboundOutcome::Accepted { message_id })
+}
+
+/// Finishes a local send direction subject to the exchange's shared bounds.
+///
+/// The stream owner retains reset ownership: this helper maps an adapter finish
+/// error to [`DeliveryError::Transport`] but performs no reset itself, allowing its
+/// caller to request exactly one reset on every failing path.
+async fn finish_with_deadline<S>(
+    stream: &mut S,
+    deadline: Instant,
+    cancellation: &DeliveryCancellation,
+) -> Result<(), DeliveryError>
+where
+    S: DeliveryStream,
+{
+    with_deadline(deadline, stream.finish(), cancellation)
+        .await
+        .and_then(|result| result.map_err(|error| DeliveryError::Transport(error.to_string())))
 }
 
 /// Maps framing failures to the delivery-level error taxonomy.
@@ -317,6 +355,7 @@ fn validate_receipt(
 #[cfg(test)]
 mod tests {
     use std::{
+        sync::Arc,
         sync::atomic::{AtomicUsize, Ordering},
         task::Poll,
         time::Duration,
@@ -346,8 +385,10 @@ mod tests {
         stream_id: u64,
         /// Whether this stream's local send half has been finished.
         finished: bool,
+        /// Whether finishing the local send half waits forever for a peer action.
+        finish_never: bool,
         /// Count of reset requests, capped at one to model idempotent reset.
-        reset_count: AtomicUsize,
+        reset_count: Arc<AtomicUsize>,
     }
 
     /// Remote ends of a [`MemoryStream`] used to drive framed peer behaviour.
@@ -369,13 +410,19 @@ mod tests {
                     receiver,
                     stream_id,
                     finished: false,
-                    reset_count: AtomicUsize::new(0),
+                    finish_never: false,
+                    reset_count: Arc::new(AtomicUsize::new(0)),
                 },
                 MemoryPeer {
                     sender: peer_sender,
                     receiver: peer_receiver,
                 },
             )
+        }
+
+        /// Configures `finish` to remain pending, simulating a stalled transport.
+        fn hang_finish(&mut self) {
+            self.finish_never = true;
         }
     }
 
@@ -397,6 +444,9 @@ mod tests {
 
         fn finish(&mut self) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send + '_>> {
             self.finished = true;
+            if self.finish_never {
+                return Box::pin(std::future::pending());
+            }
             Box::pin(async move { self.sender.shutdown().await })
         }
 
@@ -632,5 +682,119 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(DeliveryError::TimedOut)));
+    }
+
+    #[tokio::test]
+    async fn outbound_exchange_cancels_hanging_finish_and_resets_once() {
+        let message_id = MessageId::new([6; 16]);
+        let (mut stream, _peer) = MemoryStream::pair(11);
+        stream.hang_finish();
+        let reset_count = stream.reset_count.clone();
+        let cancellation = DeliveryCancellation::new();
+        let exchange = outbound_exchange(
+            &mut stream,
+            WireEnvelope::new(ChatFrame::text(message_id, 60, "stalled").unwrap()),
+            Instant::now() + Duration::from_secs(1),
+            &cancellation,
+            |_| {},
+        );
+        tokio::pin!(exchange);
+        std::future::poll_fn(|context| {
+            assert!(exchange.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(cancellation.cancel());
+
+        {
+            let result = tokio::time::timeout(Duration::from_millis(50), &mut exchange).await;
+            assert!(matches!(result, Ok(Err(DeliveryError::TimedOut))));
+        }
+        assert_eq!(reset_count.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn inbound_exchange_cancels_hanging_authorisation_and_resets_once() {
+        let message_id = MessageId::new([7; 16]);
+        let (mut stream, mut peer) = MemoryStream::pair(12);
+        write_document(
+            &mut peer.sender,
+            &WireEnvelope::new(ChatFrame::text(message_id, 70, "authorise").unwrap()),
+        )
+        .await
+        .unwrap();
+        peer.sender.shutdown().await.unwrap();
+        let (incoming_tx, _incoming_rx) = mpsc::channel(1);
+        let reset_count = stream.reset_count.clone();
+        let cancellation = DeliveryCancellation::new();
+        let exchange = inbound_exchange(
+            &mut stream,
+            PeerId::from_canonical("pending-authorisation".to_owned()),
+            &incoming_tx,
+            Instant::now() + Duration::from_secs(1),
+            &cancellation,
+            std::future::pending,
+            |_| {},
+        );
+        tokio::pin!(exchange);
+        std::future::poll_fn(|context| {
+            assert!(exchange.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(cancellation.cancel());
+
+        {
+            let result = tokio::time::timeout(Duration::from_millis(50), &mut exchange).await;
+            assert!(matches!(result, Ok(Err(DeliveryError::TimedOut))));
+        }
+        assert_eq!(reset_count.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn inbound_exchange_cancels_full_publish_queue_and_resets_once() {
+        let message_id = MessageId::new([8; 16]);
+        let (mut stream, mut peer) = MemoryStream::pair(13);
+        write_document(
+            &mut peer.sender,
+            &WireEnvelope::new(ChatFrame::text(message_id, 80, "publish").unwrap()),
+        )
+        .await
+        .unwrap();
+        peer.sender.shutdown().await.unwrap();
+        let (incoming_tx, _incoming_rx) = mpsc::channel(1);
+        incoming_tx
+            .send(IncomingText {
+                peer_id: PeerId::from_canonical("queue-holder".to_owned()),
+                message_id: MessageId::new([9; 16]),
+                sent_at_unix_ms: 0,
+                body: "fills queue".to_owned(),
+            })
+            .await
+            .unwrap();
+        let reset_count = stream.reset_count.clone();
+        let cancellation = DeliveryCancellation::new();
+        let exchange = inbound_exchange(
+            &mut stream,
+            PeerId::from_canonical("queued-peer".to_owned()),
+            &incoming_tx,
+            Instant::now() + Duration::from_secs(1),
+            &cancellation,
+            || async { true },
+            |_| {},
+        );
+        tokio::pin!(exchange);
+        std::future::poll_fn(|context| {
+            assert!(exchange.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(cancellation.cancel());
+
+        {
+            let result = tokio::time::timeout(Duration::from_millis(50), &mut exchange).await;
+            assert!(matches!(result, Ok(Err(DeliveryError::TimedOut))));
+        }
+        assert_eq!(reset_count.load(Ordering::Acquire), 1);
     }
 }
